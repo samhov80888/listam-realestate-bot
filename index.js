@@ -55,6 +55,7 @@ function loadStore() {
       return {};
     }
 
+    /** @type {Record<string, PerUrlEntry>} */
     const perUrl = {};
 
     for (const [url, v] of Object.entries(parsed)) {
@@ -121,7 +122,7 @@ function extractItemId(link) {
 // Սկզբնական լոգեր
 // ──────────────────────────────────────────────
 const store = loadStore();
-const urls = safeParseUrls(SEARCH_URLS);
+const urls = safeParseUrls(SEARCH_URLS || '[]');
 
 let totalSeen = 0;
 const perUrlDebug = {};
@@ -310,7 +311,7 @@ async function buildNewestUnseenMessage() {
   }
 
   const limit = pLimit(Number(CONCURRENCY));
-  /** @type {{link: string; sourceUrl: string; id: number | null}[]} */
+  /** @type {{link: string; sourceUrl: string; id: number}[]} */
   const freshItems = [];
 
   await Promise.all(
@@ -322,22 +323,18 @@ async function buildNewestUnseenMessage() {
         for (const link of links) {
           const id = extractItemId(link);
 
+          // Եթե ID չկար, չենք կարող "նոր տեղադրված" ճշգրիտ որոշել → skip
           if (id == null) {
-            // fallback ըստ link-ի՝ եթե id չունի
-            if (!entry.seen.has(link)) {
-              freshItems.push({ link, sourceUrl: u, id: null });
-            }
             continue;
           }
 
-          // per-URL maxId logic
+          // per-URL maxId logic → ԱՅՍՏԵՂՆ Է ԳԼԽԱՎՈՐ ՄԱՍԸ
+          // միայն ID > maxId–երն ենք համարում նոր տեղադրված
           if (entry.maxId != null && id <= entry.maxId) {
             continue; // հին հայտարարություն՝ կոնկրետ այս URL-ի համար
           }
 
-          if (!entry.seen.has(link)) {
-            freshItems.push({ link, sourceUrl: u, id });
-          }
+          freshItems.push({ link, sourceUrl: u, id });
         }
       })
     )
@@ -348,10 +345,7 @@ async function buildNewestUnseenMessage() {
   }
 
   // sort՝ ամենաթարմ ID-ները վերևում
-  freshItems.sort((a, b) => {
-    if (a.id == null || b.id == null) return 0;
-    return b.id - a.id;
-  });
+  freshItems.sort((a, b) => b.id - a.id);
 
   // եթե MAX_NEW_PER_TICK > 0 → կտրում ենք, հակառակ դեպքում՝ ուղարկում ենք բոլորին
   let newest = freshItems;
@@ -360,14 +354,11 @@ async function buildNewestUnseenMessage() {
     newest = freshItems.slice(0, max);
   }
 
-  // update per-url seen + maxId
-  newest.forEach(({ link, sourceUrl, id }) => {
+  // update per-url maxId (ստորադաս → ամենամեծ ID–ն դառնում է նոր maxId)
+  newest.forEach(({ sourceUrl, id }) => {
     const entry = getPerUrlEntry(store, sourceUrl);
-    entry.seen.add(link);
-    if (id != null) {
-      if (entry.maxId == null || id > entry.maxId) {
-        entry.maxId = id;
-      }
+    if (entry.maxId == null || id > entry.maxId) {
+      entry.maxId = id;
     }
   });
 
