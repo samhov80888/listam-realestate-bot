@@ -1,4 +1,4 @@
-// index.js — List.am: ուղարկում է ՄԻԱՅՆ նոր տեղադրված հայտարարություններից max 5 հատ
+// index.js — List.am: ուղարկում է ՄԻԱՅՆ նոր տեղադրված հայտարարություններ (per-URL maxId)
 import 'dotenv/config';
 import axios from 'axios';
 import * as cheerio from 'cheerio';
@@ -14,7 +14,7 @@ const {
   REQUEST_TIMEOUT_MS = '10000',
   CONCURRENCY = '3',
   NODE_ENV,
-  MAX_NEW_PER_TICK = '5',
+  MAX_NEW_PER_TICK = '0', // 0 -> ուղարկել բոլոր նորերը
   SEEN_STORE_PATH = './seen-items.json',
 } = process.env;
 
@@ -31,37 +31,82 @@ function safeParseUrls(raw) {
 }
 
 // ──────────────────────────────────────────────
-// Seen store (seen + maxId)
+// Seen store — ԱՌԱՆՁԻՆ per URL
+// Ֆայլի ֆորմատը․
+// {
+//   "<url1>": { "seen": ["https://www.list.am/item/..", ...], "maxId": 23000000 },
+//   "<url2>": { "seen": [...], "maxId": 22900000 }
+// }
 // ──────────────────────────────────────────────
+
+/**
+ * @typedef {{ seen: Set<string>; maxId: number | null }} PerUrlEntry
+ */
+
+/**
+ * @returns {Record<string, PerUrlEntry>}
+ */
 function loadStore() {
   try {
     const raw = fs.readFileSync(SEEN_STORE_PATH, 'utf-8');
     const parsed = JSON.parse(raw);
 
-    // Հին ձևաչափից мигրացիա (երբ պահում էինք ուղղակի array)
-    if (Array.isArray(parsed)) {
-      return { seen: new Set(parsed), maxId: null };
+    if (!parsed || typeof parsed !== 'object') {
+      return {};
     }
 
-    const seenArr = Array.isArray(parsed.seen) ? parsed.seen : [];
-    const maxId =
-      typeof parsed.maxId === 'number' && Number.isFinite(parsed.maxId)
-        ? parsed.maxId
-        : null;
+    const perUrl = {};
 
-    return { seen: new Set(seenArr), maxId };
+    for (const [url, v] of Object.entries(parsed)) {
+      if (!v || typeof v !== 'object') continue;
+
+      const seenArr = Array.isArray(v.seen) ? v.seen : [];
+      const maxId =
+        typeof v.maxId === 'number' && Number.isFinite(v.maxId)
+          ? v.maxId
+          : null;
+
+      perUrl[url] = {
+        seen: new Set(seenArr),
+        maxId,
+      };
+    }
+
+    return perUrl;
   } catch {
-    return { seen: new Set(), maxId: null };
+    return {};
   }
 }
 
-function saveStore(seen, maxId) {
+/**
+ * @param {Record<string, PerUrlEntry>} store
+ */
+function saveStore(store) {
   try {
-    const obj = { seen: [...seen], maxId: maxId ?? null };
-    fs.writeFileSync(SEEN_STORE_PATH, JSON.stringify(obj), 'utf-8');
+    const out = {};
+    for (const [url, entry] of Object.entries(store)) {
+      out[url] = {
+        seen: [...entry.seen],
+        maxId: entry.maxId ?? null,
+      };
+    }
+    fs.writeFileSync(SEEN_STORE_PATH, JSON.stringify(out), 'utf-8');
   } catch (e) {
     console.error('⚠️ Cannot write seen store:', e.message);
   }
+}
+
+/**
+ * lazy-init per-url entry
+ * @param {Record<string, PerUrlEntry>} store
+ * @param {string} url
+ * @returns {PerUrlEntry}
+ */
+function getPerUrlEntry(store, url) {
+  if (!store[url]) {
+    store[url] = { seen: new Set(), maxId: null };
+  }
+  return store[url];
 }
 
 // item ID–ն հանում ենք link–ից՝ /item/23085989
@@ -75,8 +120,16 @@ function extractItemId(link) {
 // ──────────────────────────────────────────────
 // Սկզբնական լոգեր
 // ──────────────────────────────────────────────
-const { seen, maxId: initialMaxId } = loadStore();
-let maxId = initialMaxId;
+const store = loadStore();
+const urls = safeParseUrls(SEARCH_URLS);
+
+let totalSeen = 0;
+const perUrlDebug = {};
+for (const u of urls) {
+  const e = getPerUrlEntry(store, u);
+  totalSeen += e.seen.size;
+  perUrlDebug[u] = { seenCount: e.seen.size, maxId: e.maxId ?? null };
+}
 
 console.log('ENV:', {
   hasToken: !!BOT_TOKEN,
@@ -84,11 +137,11 @@ console.log('ENV:', {
   intervalMs: Number(INTERVAL_MS),
   timeoutMs: Number(REQUEST_TIMEOUT_MS),
   concurrency: Number(CONCURRENCY),
-  urlsCount: safeParseUrls(SEARCH_URLS).length,
+  urlsCount: urls.length,
   maxNewPerTick: Number(MAX_NEW_PER_TICK),
   seenStorePath: SEEN_STORE_PATH,
-  seenCount: seen.size,
-  maxId,
+  totalSeen,
+  perUrl: perUrlDebug,
 });
 
 if (!BOT_TOKEN || !CHAT_ID) {
@@ -199,59 +252,59 @@ function getLabelForSourceUrl(sourceUrl) {
 }
 
 // ──────────────────────────────────────────────
-// Warmup — եթե seen-ը դատարկ է, մի անգամ ստարտի պահին
+// Warmup — եթե ԲՈԼՈՐ URL-ների համար seen/maxId չկա
 // ──────────────────────────────────────────────
-async function warmupSeenIfEmpty() {
-  if (seen.size > 0) {
-    return false; // արդեն ունենք տվյալներ, warmup պետք չէ
+async function warmupIfAllEmpty() {
+  if (!urls.length) return false;
+
+  const hasAnyData = urls.some((u) => {
+    const e = getPerUrlEntry(store, u);
+    return e.seen.size > 0 || e.maxId != null;
+  });
+
+  if (hasAnyData) {
+    return false; // արդեն կա store տվյալ
   }
 
   console.log(
-    '🔥 Warmup: seen is empty, seeding with CURRENT items (հետո կուղարկենք միայն ավելի նոր ID-ներ)'
+    '🔥 Warmup: store is empty, seeding with CURRENT items per URL (հետո կուղարկենք միայն ավելի նոր ID-ներ)'
   );
 
-  const urls = safeParseUrls(SEARCH_URLS);
   const limit = pLimit(Number(CONCURRENCY));
-  const allLinks = new Set();
 
   await Promise.all(
     urls.map((u) =>
       limit(async () => {
         const links = await fetchItemLinks(u);
-        links.forEach((l) => allLinks.add(l));
+        const entry = getPerUrlEntry(store, u);
+
+        links.forEach((l) => {
+          entry.seen.add(l);
+          const id = extractItemId(l);
+          if (id != null) {
+            if (entry.maxId == null || id > entry.maxId) {
+              entry.maxId = id;
+            }
+          }
+        });
+
+        console.log(
+          `   ↳ Warmup for ${u}: seen=${entry.seen.size}, maxId=${entry.maxId ?? 'null'}`
+        );
       })
     )
   );
 
-  let warmupMaxId = maxId ?? null;
+  saveStore(store);
 
-  allLinks.forEach((l) => {
-    seen.add(l);
-    const id = extractItemId(l);
-    if (id != null) {
-      if (warmupMaxId == null || id > warmupMaxId) {
-        warmupMaxId = id;
-      }
-    }
-  });
-
-  maxId = warmupMaxId;
-  saveStore(seen, maxId);
-
-  console.log(
-    '🔥 Warmup done, seeded items:',
-    seen.size,
-    'maxId =',
-    maxId ?? 'null'
-  );
+  console.log('🔥 Warmup done.');
   return true;
 }
 
 // ──────────────────────────────────────────────
-// Build message with *truly new* items (ID > maxId)
+// Build message with *truly new* items (ID > per-url maxId)
 // ──────────────────────────────────────────────
 async function buildNewestUnseenMessage() {
-  const urls = safeParseUrls(SEARCH_URLS);
   if (!urls.length) {
     return { any: false, text: '' };
   }
@@ -263,27 +316,26 @@ async function buildNewestUnseenMessage() {
   await Promise.all(
     urls.map((u) =>
       limit(async () => {
+        const entry = getPerUrlEntry(store, u);
         const links = await fetchItemLinks(u);
+
         for (const link of links) {
           const id = extractItemId(link);
 
-          // Եթե ID չունի, fallback-ով միայն 'seen'–ով ստուգենք
           if (id == null) {
-            if (!seen.has(link)) {
+            // fallback ըստ link-ի՝ եթե id չունի
+            if (!entry.seen.has(link)) {
               freshItems.push({ link, sourceUrl: u, id: null });
             }
             continue;
           }
 
-          // Եթե ունենք maxId և այս ID-ն <= maxId, համարում ենք
-          // «հին» հայտարարություն (դրանից առաջ արդեն կային),
-          // անգամ եթե link-ը երբեք չենք տեսել։
-          if (maxId != null && id <= maxId) {
-            continue;
+          // per-URL maxId logic
+          if (entry.maxId != null && id <= entry.maxId) {
+            continue; // հին հայտարարություն՝ կոնկրետ այս URL-ի համար
           }
 
-          // Այստեղ ID > maxId կամ maxId=null, ու link-ը նոր է նաև 'seen'-ի տեսանկյունից
-          if (!seen.has(link)) {
+          if (!entry.seen.has(link)) {
             freshItems.push({ link, sourceUrl: u, id });
           }
         }
@@ -295,25 +347,31 @@ async function buildNewestUnseenMessage() {
     return { any: false, text: '' };
   }
 
-  // Կարող ենք sort անել ըստ ID–ի նվազման (ամենամեծը՝ ամենաթարմը)
+  // sort՝ ամենաթարմ ID-ները վերևում
   freshItems.sort((a, b) => {
     if (a.id == null || b.id == null) return 0;
     return b.id - a.id;
   });
 
+  // եթե MAX_NEW_PER_TICK > 0 → կտրում ենք, հակառակ դեպքում՝ ուղարկում ենք բոլորին
+  let newest = freshItems;
   const max = Number(MAX_NEW_PER_TICK);
-  const newest = freshItems.slice(0, max);
+  if (Number.isFinite(max) && max > 0) {
+    newest = freshItems.slice(0, max);
+  }
 
-  // update seen + maxId
-  newest.forEach(({ link, id }) => {
-    seen.add(link);
+  // update per-url seen + maxId
+  newest.forEach(({ link, sourceUrl, id }) => {
+    const entry = getPerUrlEntry(store, sourceUrl);
+    entry.seen.add(link);
     if (id != null) {
-      if (maxId == null || id > maxId) {
-        maxId = id;
+      if (entry.maxId == null || id > entry.maxId) {
+        entry.maxId = id;
       }
     }
   });
-  saveStore(seen, maxId);
+
+  saveStore(store);
 
   const lines = ['🆕 Վերջին նոր տեղադրված հայտարարություններ՝'];
   newest.forEach(({ link, sourceUrl }) => {
@@ -334,7 +392,7 @@ async function tick() {
   try {
     console.log('⏳ tick...');
 
-    const didWarmup = await warmupSeenIfEmpty();
+    const didWarmup = await warmupIfAllEmpty();
     if (didWarmup) {
       console.log('↩️ Warmup tick finished — no messages sent');
       return;
@@ -356,7 +414,7 @@ async function tick() {
     await bot.telegram.sendMessage(CHAT_ID, text, {
       disable_web_page_preview: false,
     });
-    console.log('📨 sent, maxId now =', maxId ?? 'null');
+    console.log('📨 sent');
   } catch (e) {
     const status = e?.response?.status;
     console.error('❌ Tick error:', status, e?.message || e);
