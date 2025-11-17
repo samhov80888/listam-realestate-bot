@@ -1,7 +1,4 @@
 node_modules
-.env
-seen-items.json
 npm-debug.log*
 yarn.lock
 pnpm-lock.yaml
-.DS_Store
