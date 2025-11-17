@@ -6,6 +6,8 @@ import { Telegraf } from 'telegraf';
 import pLimit from 'p-limit';
 import fs from 'fs';
 
+// ⚠️ Այստեղ ուրիշ dotenv config պետք չի — import 'dotenv/config' արդեն կարդում է .env-ը
+
 const {
   BOT_TOKEN,
   CHAT_ID,
@@ -18,6 +20,7 @@ const {
   SEEN_STORE_PATH = './seen-items.json',
 } = process.env;
 
+
 // ──────────────────────────────────────────────
 // Օգնական՝ SEARCH_URLS
 // ──────────────────────────────────────────────
@@ -29,15 +32,6 @@ function safeParseUrls(raw) {
     return [];
   }
 }
-
-// ──────────────────────────────────────────────
-// Seen store — ԱՌԱՆՁԻՆ per URL
-// Ֆայլի ֆորմատը․
-// {
-//   "<url1>": { "seen": ["https://www.list.am/item/..", ...], "maxId": 23000000 },
-//   "<url2>": { "seen": [...], "maxId": 22900000 }
-// }
-// ──────────────────────────────────────────────
 
 /**
  * @typedef {{ seen: Set<string>; maxId: number | null }} PerUrlEntry
@@ -119,7 +113,7 @@ function extractItemId(link) {
 }
 
 // ──────────────────────────────────────────────
-// Սկզբնական լոգեր
+// Սկզբնական store / urls / debug info
 // ──────────────────────────────────────────────
 const store = loadStore();
 const urls = safeParseUrls(SEARCH_URLS || '[]');
@@ -149,30 +143,6 @@ if (!BOT_TOKEN || !CHAT_ID) {
   console.error('❌ .env-ում պետք է լինի BOT_TOKEN և CHAT_ID');
   process.exit(1);
 }
-
-// ──────────────────────────────────────────────
-// Token check
-// ──────────────────────────────────────────────
-try {
-  const { data: g } = await axios.get(
-    `https://api.telegram.org/bot${BOT_TOKEN}/getMe`,
-    { timeout: 8000 }
-  );
-  console.log('🧪 getMe:', g);
-  if (!g?.ok) {
-    console.error('❌ Invalid token:', g?.description || g);
-    process.exit(1);
-  }
-} catch (e) {
-  console.error('❌ getMe failed:', e?.message || e);
-  process.exit(1);
-}
-
-// ──────────────────────────────────────────────
-// Bot (send-only mode)
-// ──────────────────────────────────────────────
-const bot = new Telegraf(BOT_TOKEN);
-console.log('🤖 Bot initialized (send-only mode)');
 
 // ──────────────────────────────────────────────
 // HTTP client
@@ -379,7 +349,7 @@ async function buildNewestUnseenMessage() {
 // ──────────────────────────────────────────────
 // Tick
 // ──────────────────────────────────────────────
-async function tick() {
+async function tick(bot) {
   try {
     console.log('⏳ tick...');
 
@@ -418,8 +388,45 @@ async function tick() {
 }
 
 // ──────────────────────────────────────────────
-// Start
+// Token check + Start (լսարանի մեջ, առանց top-level await)
 // ──────────────────────────────────────────────
-console.log('✅ Bot started. Interval =', INTERVAL_MS, 'ms');
-tick();
-setInterval(tick, Number(INTERVAL_MS));
+async function checkToken() {
+  try {
+    const { data: g } = await axios.get(
+      `https://api.telegram.org/bot${BOT_TOKEN}/getMe`,
+      { timeout: 8000 }
+    );
+    console.log('🧪 getMe:', g);
+    if (!g?.ok) {
+      console.error('❌ Invalid token (but continuing):', g?.description || g);
+      // այստեղ այլևս չենք անում process.exit
+    }
+  } catch (e) {
+    // Ավելի մանրամասն log անենք
+    console.error(
+      '⚠️ getMe failed, but continuing anyway:',
+      e?.response?.status,
+      e?.code,
+      e?.message
+    );
+    // ՈՉԻՆՉ ՉԵՆՔ ՓԱԿՈՒՄ
+    // process.exit(1) ՉԿԱ
+  }
+}
+
+
+async function start() {
+  await checkToken();
+
+  const bot = new Telegraf(BOT_TOKEN);
+  console.log('🤖 Bot initialized (send-only mode)');
+
+  console.log('✅ Bot started. Interval =', INTERVAL_MS, 'ms');
+  await tick(bot);
+  setInterval(() => tick(bot), Number(INTERVAL_MS));
+}
+
+start().catch((e) => {
+  console.error('💥 Fatal error in main:', e);
+  process.exit(1);
+});
