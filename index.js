@@ -1,432 +1,315 @@
-// index.js — List.am: ուղարկում է ՄԻԱՅՆ նոր տեղադրված հայտարարություններ (per-URL maxId)
+// index.js — List.am Bot SUPER STABLE (text only)
+
 import 'dotenv/config';
-import axios from 'axios';
-import * as cheerio from 'cheerio';
-import { Telegraf } from 'telegraf';
-import pLimit from 'p-limit';
 import fs from 'fs';
+import pLimit from 'p-limit';
+import { Telegraf } from 'telegraf';
+import puppeteer from 'puppeteer-extra';
+import StealthPlugin from 'puppeteer-extra-plugin-stealth';
 
-// ⚠️ Այստեղ ուրիշ dotenv config պետք չի — import 'dotenv/config' արդեն կարդում է .env-ը
+puppeteer.use(StealthPlugin());
 
+// ====================== ENV ======================
 const {
   BOT_TOKEN,
   CHAT_ID,
   SEARCH_URLS,
-  INTERVAL_MS = '120000', // 2 րոպե
-  REQUEST_TIMEOUT_MS = '10000',
-  CONCURRENCY = '3',
-  NODE_ENV,
-  MAX_NEW_PER_TICK = '0', // 0 -> ուղարկել բոլոր նորերը
+  INTERVAL_MS = '1200000',        // default 20 րոպե
+  PROXY_HOST,
+  PROXY_PORT,
+  PROXY_USER,
+  PROXY_PASS,
+  MAX_NEW_PER_TICK = '0',         // 0 = ուղարկել բոլոր նորերը
   SEEN_STORE_PATH = './seen-items.json',
+  PUPPETEER_EXECUTABLE_PATH,      // Hetzner-ի համար կարող ես դնել /usr/bin/chromium-browser
 } = process.env;
 
+const urls = JSON.parse(SEARCH_URLS || '[]');
 
-// ──────────────────────────────────────────────
-// Օգնական՝ SEARCH_URLS
-// ──────────────────────────────────────────────
-function safeParseUrls(raw) {
-  try {
-    const arr = JSON.parse(raw || '[]');
-    return Array.isArray(arr) ? arr : [];
-  } catch {
-    return [];
-  }
+if (!BOT_TOKEN || !CHAT_ID || urls.length === 0) {
+  console.error('❌ Պարտադիր են BOT_TOKEN, CHAT_ID և SEARCH_URLS');
+  process.exit(1);
 }
 
-/**
- * @typedef {{ seen: Set<string>; maxId: number | null }} PerUrlEntry
- */
-
-/**
- * @returns {Record<string, PerUrlEntry>}
- */
+// ====================== STORE ======================
 function loadStore() {
   try {
-    const raw = fs.readFileSync(SEEN_STORE_PATH, 'utf-8');
-    const parsed = JSON.parse(raw);
-
-    if (!parsed || typeof parsed !== 'object') {
-      return {};
-    }
-
-    /** @type {Record<string, PerUrlEntry>} */
-    const perUrl = {};
-
-    for (const [url, v] of Object.entries(parsed)) {
-      if (!v || typeof v !== 'object') continue;
-
-      const seenArr = Array.isArray(v.seen) ? v.seen : [];
-      const maxId =
-        typeof v.maxId === 'number' && Number.isFinite(v.maxId)
-          ? v.maxId
-          : null;
-
-      perUrl[url] = {
-        seen: new Set(seenArr),
-        maxId,
-      };
-    }
-
-    return perUrl;
+    return JSON.parse(fs.readFileSync(SEEN_STORE_PATH, 'utf8')) || {};
   } catch {
+    console.log('ℹ️ Store ֆայլ չկա, սկսում եմ 0–ից');
     return {};
   }
 }
 
-/**
- * @param {Record<string, PerUrlEntry>} store
- */
-function saveStore(store) {
+function saveStore(data) {
   try {
-    const out = {};
-    for (const [url, entry] of Object.entries(store)) {
-      out[url] = {
-        seen: [...entry.seen],
-        maxId: entry.maxId ?? null,
-      };
-    }
-    fs.writeFileSync(SEEN_STORE_PATH, JSON.stringify(out), 'utf-8');
+    fs.writeFileSync(SEEN_STORE_PATH, JSON.stringify(data, null, 2));
   } catch (e) {
-    console.error('⚠️ Cannot write seen store:', e.message);
+    console.error('❌ Չհաջողվեց պահպանել store-ը:', e.message);
   }
 }
 
-/**
- * lazy-init per-url entry
- * @param {Record<string, PerUrlEntry>} store
- * @param {string} url
- * @returns {PerUrlEntry}
- */
-function getPerUrlEntry(store, url) {
-  if (!store[url]) {
-    store[url] = { seen: new Set(), maxId: null };
+let store = loadStore(); // { [url]: { maxId: number } }
+
+// ====================== HELPERS ======================
+function extractId(url) {
+  const m = /\/item\/(\d+)/.exec(url);
+  return m ? Number(m[1]) : null;
+}
+
+function getLabel(url) {
+  if (url.includes('/category/60')) return 'Տներ';
+  if (url.includes('/category/1386')) return 'Բիզնես';
+  return 'Անշարժ գույք';
+}
+
+function sleep(ms) {
+  return new Promise(res => setTimeout(res, ms));
+}
+
+// ====================== BROWSER HELPERS ======================
+async function launchBrowser() {
+  const args = [
+    '--no-sandbox',
+    '--disable-setuid-sandbox',
+    '--disable-gpu',
+    '--disable-dev-shm-usage',
+    '--disable-web-security',
+    '--disable-features=IsolateOrigins,site-per-process',
+  ];
+
+  if (PROXY_HOST && PROXY_PORT) {
+    args.push(`--proxy-server=${PROXY_HOST}:${PROXY_PORT}`);
+    console.log('🌐 Proxy enabled:', PROXY_HOST, PROXY_PORT);
   }
-  return store[url];
+
+  const launchOptions = {
+    headless: true,
+    args,
+  };
+
+  if (PUPPETEER_EXECUTABLE_PATH) {
+    launchOptions.executablePath = PUPPETEER_EXECUTABLE_PATH;
+  }
+
+  const browser = await puppeteer.launch(launchOptions);
+  return browser;
 }
 
-// item ID–ն հանում ենք link–ից՝ /item/23085989
-function extractItemId(link) {
-  const m = /\/item\/(\d+)/.exec(link);
-  if (!m) return null;
-  const n = Number(m[1]);
-  return Number.isFinite(n) ? n : null;
-}
+async function createPage(browser) {
+  const page = await browser.newPage();
 
-// ──────────────────────────────────────────────
-// Սկզբնական store / urls / debug info
-// ──────────────────────────────────────────────
-const store = loadStore();
-const urls = safeParseUrls(SEARCH_URLS || '[]');
+  if (PROXY_USER && PROXY_PASS) {
+    await page.authenticate({ username: PROXY_USER, password: PROXY_PASS });
+  }
 
-let totalSeen = 0;
-const perUrlDebug = {};
-for (const u of urls) {
-  const e = getPerUrlEntry(store, u);
-  totalSeen += e.seen.size;
-  perUrlDebug[u] = { seenCount: e.seen.size, maxId: e.maxId ?? null };
-}
+  await page.setUserAgent(
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+  );
 
-console.log('ENV:', {
-  hasToken: !!BOT_TOKEN,
-  chatId: CHAT_ID,
-  intervalMs: Number(INTERVAL_MS),
-  timeoutMs: Number(REQUEST_TIMEOUT_MS),
-  concurrency: Number(CONCURRENCY),
-  urlsCount: urls.length,
-  maxNewPerTick: Number(MAX_NEW_PER_TICK),
-  seenStorePath: SEEN_STORE_PATH,
-  totalSeen,
-  perUrl: perUrlDebug,
-});
-
-if (!BOT_TOKEN || !CHAT_ID) {
-  console.error('❌ .env-ում պետք է լինի BOT_TOKEN և CHAT_ID');
-  process.exit(1);
-}
-
-// ──────────────────────────────────────────────
-// HTTP client
-// ──────────────────────────────────────────────
-const http = axios.create({
-  timeout: Number(REQUEST_TIMEOUT_MS),
-  headers: {
-    'User-Agent': 'Mozilla/5.0 (compatible; listam-realestate-bot/1.0)',
+  await page.setExtraHTTPHeaders({
     'Accept-Language': 'hy-AM,hy;q=0.9,en;q=0.8',
-    Accept: 'text/html,application/xhtml+xml',
-  },
-});
+    Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+  });
 
-// ──────────────────────────────────────────────
-// Scraper helpers
-// ──────────────────────────────────────────────
-function toAbsolute(url) {
-  if (!url) return null;
-  if (url.startsWith('http')) return url;
-  if (url.startsWith('/')) return 'https://www.list.am' + url;
-  return 'https://www.list.am/' + url;
+  return page;
 }
 
-async function fetchItemLinks(url) {
-  console.log(' → fetching:', url);
+// ====================== SCRAPERS ======================
+async function fetchItemLinks(browser, url) {
+  let page;
   try {
-    const { data: html, status } = await http.get(url);
-    console.log(`   ↳ status ${status}`);
-    const $ = cheerio.load(html);
+    page = await createPage(browser);
+    console.log('🔎 Բացում եմ →', url);
 
-    const links = [];
-    $('.dl a, .gl a').each((_, el) => {
-      const href = $(el).attr('href');
-      if (href && /\/item\/\d+/.test(href)) {
-        const abs = toAbsolute(href);
-        if (abs && !links.includes(abs)) links.push(abs);
-      }
-    });
+    await page.goto(url, { waitUntil: 'networkidle2', timeout: 60000 });
+    await page.waitForSelector('a[href*="/item/"]', { timeout: 30000 });
 
-    if (!links.length) {
-      $('a').each((_, el) => {
-        const href = $(el).attr('href');
-        if (href && /\/item\/\d+/.test(href)) {
-          const abs = toAbsolute(href);
-          if (abs && !links.includes(abs)) links.push(abs);
+    const links = await page.evaluate(() => {
+      const set = new Set();
+      document.querySelectorAll('a[href*="/item/"]').forEach(a => {
+        let h = a.getAttribute('href') || a.href;
+        if (h && /\/item\/\d+/.test(h)) {
+          if (!h.startsWith('http')) h = 'https://www.list.am' + h;
+          set.add(h.split('?')[0]);
         }
       });
-    }
+      return [...set];
+    });
 
-    if (NODE_ENV === 'development') {
-      console.log(`   ↳ extracted ${links.length} item link(s)`);
-    }
-
+    console.log(`   → Գտա ${links.length} հայտարարություն`);
     return links;
-  } catch (e) {
-    const status = e?.response?.status;
-    if (status === 403) {
-      console.log('⚠️ 403 Forbidden (list.am rate-limit) — skip this URL this tick');
-      return [];
-    }
-    throw e;
+  } catch (err) {
+    console.error('❌ Scrape error (list):', url, err.message);
+    return [];
+  } finally {
+    if (page) await page.close();
   }
 }
 
-// Label ըստ URL-ի
-function getLabelForSourceUrl(sourceUrl) {
+async function fetchItemDetails(browser, link) {
+  let page;
   try {
-    const u = new URL(sourceUrl);
-    const path = u.pathname || '';
+    page = await createPage(browser);
+    await page.goto(link, { waitUntil: 'domcontentloaded', timeout: 60000 });
+    await page.waitForSelector('body', { timeout: 30000 }); // էլ չենք սպասում կոնկրետ .gl-header-ին
 
-    if (/\/category\/60/.test(path)) return 'Տներ';
-    if (/\/category\/1386/.test(path)) return 'Բիզնես';
+    const data = await page.evaluate(() => {
+      const title =
+        document.querySelector('.gl-header')?.innerText?.trim() ||
+        document.querySelector('.at')?.innerText?.trim() ||
+        'Անվերնագիր';
 
-    return 'Անշարժ գույք';
-  } catch {
-    return 'Անշարժ գույք';
+      const price =
+        document.querySelector('.price')?.innerText?.trim() ||
+        document.querySelector('.gl-prc')?.innerText?.trim() ||
+        'Գին նշված չէ';
+
+      const descRaw =
+        document.querySelector('#desc')?.innerText?.trim() ||
+        document.querySelector('.gl-dsc')?.innerText?.trim() ||
+        '';
+
+      const description = descRaw || 'Առանց նկարագրության';
+
+      return { title, price, description };
+    });
+
+    return data;
+  } catch (err) {
+    console.error('❌ Item detail error:', link, err.message);
+    return {
+      title: 'Անվերնագիր',
+      price: 'Գին չկա',
+      description: 'Նկարագրություն չկա',
+    };
+  } finally {
+    if (page) await page.close();
   }
 }
 
-// ──────────────────────────────────────────────
-// Warmup — եթե ԲՈԼՈՐ URL-ների համար seen/maxId չկա
-// ──────────────────────────────────────────────
-async function warmupIfAllEmpty() {
-  if (!urls.length) return false;
-
-  const hasAnyData = urls.some((u) => {
-    const e = getPerUrlEntry(store, u);
-    return e.seen.size > 0 || e.maxId != null;
-  });
-
-  if (hasAnyData) {
-    return false; // արդեն կա store տվյալ
-  }
-
-  console.log(
-    '🔥 Warmup: store is empty, seeding with CURRENT items per URL (հետո կուղարկենք միայն ավելի նոր ID-ներ)'
+// ====================== WARMUP ======================
+async function warmupIfNeeded(browser) {
+  const hasWarmup = Object.values(store).some(
+    v => v && v.maxId != null,
   );
+  if (hasWarmup) return;
 
-  const limit = pLimit(Number(CONCURRENCY));
+  console.log('🔥 Առաջին գործարկում → WARMUP');
+
+  const limit = pLimit(2);
 
   await Promise.all(
-    urls.map((u) =>
+    urls.map(url =>
       limit(async () => {
-        const links = await fetchItemLinks(u);
-        const entry = getPerUrlEntry(store, u);
-
-        links.forEach((l) => {
-          entry.seen.add(l);
-          const id = extractItemId(l);
-          if (id != null) {
-            if (entry.maxId == null || id > entry.maxId) {
-              entry.maxId = id;
-            }
-          }
-        });
-
-        console.log(
-          `   ↳ Warmup for ${u}: seen=${entry.seen.size}, maxId=${entry.maxId ?? 'null'}`
-        );
-      })
-    )
-  );
-
-  saveStore(store);
-
-  console.log('🔥 Warmup done.');
-  return true;
-}
-
-// ──────────────────────────────────────────────
-// Build message with *truly new* items (ID > per-url maxId)
-// ──────────────────────────────────────────────
-async function buildNewestUnseenMessage() {
-  if (!urls.length) {
-    return { any: false, text: '' };
-  }
-
-  const limit = pLimit(Number(CONCURRENCY));
-  /** @type {{link: string; sourceUrl: string; id: number}[]} */
-  const freshItems = [];
-
-  await Promise.all(
-    urls.map((u) =>
-      limit(async () => {
-        const entry = getPerUrlEntry(store, u);
-        const links = await fetchItemLinks(u);
+        const links = await fetchItemLinks(browser, url);
+        store[url] = store[url] || { maxId: null };
 
         for (const link of links) {
-          const id = extractItemId(link);
-
-          // Եթե ID չկար, չենք կարող "նոր տեղադրված" ճշգրիտ որոշել → skip
-          if (id == null) {
-            continue;
+          const id = extractId(link);
+          if (id && (!store[url].maxId || id > store[url].maxId)) {
+            store[url].maxId = id;
           }
-
-          // per-URL maxId logic → ԱՅՍՏԵՂՆ Է ԳԼԽԱՎՈՐ ՄԱՍԸ
-          // միայն ID > maxId–երն ենք համարում նոր տեղադրված
-          if (entry.maxId != null && id <= entry.maxId) {
-            continue; // հին հայտարարություն՝ կոնկրետ այս URL-ի համար
-          }
-
-          freshItems.push({ link, sourceUrl: u, id });
         }
-      })
-    )
+      }),
+    ),
   );
 
-  if (!freshItems.length) {
-    return { any: false, text: '' };
-  }
-
-  // sort՝ ամենաթարմ ID-ները վերևում
-  freshItems.sort((a, b) => b.id - a.id);
-
-  // եթե MAX_NEW_PER_TICK > 0 → կտրում ենք, հակառակ դեպքում՝ ուղարկում ենք բոլորին
-  let newest = freshItems;
-  const max = Number(MAX_NEW_PER_TICK);
-  if (Number.isFinite(max) && max > 0) {
-    newest = freshItems.slice(0, max);
-  }
-
-  // update per-url maxId (ստորադաս → ամենամեծ ID–ն դառնում է նոր maxId)
-  newest.forEach(({ sourceUrl, id }) => {
-    const entry = getPerUrlEntry(store, sourceUrl);
-    if (entry.maxId == null || id > entry.maxId) {
-      entry.maxId = id;
-    }
-  });
-
   saveStore(store);
-
-  const lines = ['🆕 Վերջին նոր տեղադրված հայտարարություններ՝'];
-  newest.forEach(({ link, sourceUrl }) => {
-    const label = getLabelForSourceUrl(sourceUrl);
-    lines.push(`• [${label}] ${link}`);
-  });
-
-  return {
-    any: true,
-    text: lines.join('\n'),
-  };
+  console.log('⚡ Warmup ավարտված');
 }
 
-// ──────────────────────────────────────────────
-// Tick
-// ──────────────────────────────────────────────
+// ====================== MAIN LOOP ======================
 async function tick(bot) {
+  console.log('\n⏱ Ստուգում եմ նոր հայտարարությունները…');
+
+  const browser = await launchBrowser();
+
   try {
-    console.log('⏳ tick...');
+    await warmupIfNeeded(browser);
 
-    const didWarmup = await warmupIfAllEmpty();
-    if (didWarmup) {
-      console.log('↩️ Warmup tick finished — no messages sent');
-      return;
-    }
+    const limit = pLimit(2);
+    const newItems = [];
 
-    const { any, text } = await buildNewestUnseenMessage();
+    await Promise.all(
+      urls.map(url =>
+        limit(async () => {
+          store[url] = store[url] || { maxId: null };
 
-    if (!any) {
-      console.log('↩️ No new items — nothing sent');
-      return;
-    }
+          const links = await fetchItemLinks(browser, url);
 
-    console.log(
-      '🧾 preview:\n' +
-        text.split('\n').slice(0, 5).join('\n') +
-        (text.includes('\n') ? '\n…' : '')
+          for (const link of links) {
+            const id = extractId(link);
+            if (!id) continue;
+
+            if (!store[url].maxId || id > store[url].maxId) {
+              newItems.push({ link, id, sourceUrl: url });
+              store[url].maxId = id;
+            }
+          }
+        }),
+      ),
     );
 
-    await bot.telegram.sendMessage(CHAT_ID, text, {
-      disable_web_page_preview: false,
-    });
-    console.log('📨 sent');
-  } catch (e) {
-    const status = e?.response?.status;
-    console.error('❌ Tick error:', status, e?.message || e);
-
-    if (status === 403) {
-      console.log('↩️ Soft skip (403) — error not sent to Telegram');
+    if (!newItems.length) {
+      console.log('😴 Նոր հայտարարություն չկա');
       return;
     }
+
+    newItems.sort((a, b) => b.id - a.id);
+
+    const maxToSend = Number(MAX_NEW_PER_TICK) || newItems.length;
+    const toSend = newItems.slice(0, maxToSend);
+
+    console.log(`📬 Ուղարկում եմ ${toSend.length} նոր հայտարարություն…`);
+
+    for (const item of toSend) {
+      const details = await fetchItemDetails(browser, item.link);
+
+      const lines = [
+        `${getLabel(item.sourceUrl)} — ՆՈՐ հայտարարություն`,
+        '',
+        `Վերնագիր: ${details.title}`,
+        `Գին: ${details.price}`,
+        '',
+        details.description,
+        '',
+        `Հղում: ${item.link}`,
+      ];
+
+      const text = lines.join('\n');
+
+      try {
+        await bot.telegram.sendMessage(CHAT_ID, text);
+        await sleep(1500); // anti-flood
+      } catch (err) {
+        console.error(
+          '❌ Telegram send error:',
+          err.response?.description || err.message,
+          'URL:',
+          item.link,
+        );
+      }
+    }
+
+    saveStore(store);
+    console.log('✅ Tick ավարտված');
+  } finally {
+    await browser.close();
   }
 }
 
-// ──────────────────────────────────────────────
-// Token check + Start (լսարանի մեջ, առանց top-level await)
-// ──────────────────────────────────────────────
-async function checkToken() {
-  try {
-    const { data: g } = await axios.get(
-      `https://api.telegram.org/bot${BOT_TOKEN}/getMe`,
-      { timeout: 8000 }
-    );
-    console.log('🧪 getMe:', g);
-    if (!g?.ok) {
-      console.error('❌ Invalid token (but continuing):', g?.description || g);
-      // այստեղ այլևս չենք անում process.exit
-    }
-  } catch (e) {
-    // Ավելի մանրամասն log անենք
-    console.error(
-      '⚠️ getMe failed, but continuing anyway:',
-      e?.response?.status,
-      e?.code,
-      e?.message
-    );
-    // ՈՉԻՆՉ ՉԵՆՔ ՓԱԿՈՒՄ
-    // process.exit(1) ՉԿԱ
-  }
-}
+// ====================== START BOT ======================
+const bot = new Telegraf(BOT_TOKEN);
 
+console.log(
+  '🤖 List.am Bot SUPER STABLE – աշխատում է, ստուգում եմ ամեն',
+  Number(INTERVAL_MS) / 60000,
+  'րոպեն մեկ',
+);
 
-async function start() {
-  await checkToken();
+tick(bot).catch(e => console.error('❌ Initial tick error:', e));
 
-  const bot = new Telegraf(BOT_TOKEN);
-  console.log('🤖 Bot initialized (send-only mode)');
-
-  console.log('✅ Bot started. Interval =', INTERVAL_MS, 'ms');
-  await tick(bot);
-  setInterval(() => tick(bot), Number(INTERVAL_MS));
-}
-
-start().catch((e) => {
-  console.error('💥 Fatal error in main:', e);
-  process.exit(1);
-});
+setInterval(() => {
+  tick(bot).catch(err => console.error('❌ Tick error:', err));
+}, Number(INTERVAL_MS));
