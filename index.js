@@ -12,7 +12,7 @@ puppeteer.use(StealthPlugin());
 // ====================== ENV ======================
 const {
   BOT_TOKEN,
-  CHAT_ID,
+  CHAT_IDS,                       // 🔹 բազմակի chatId-ներ
   SEARCH_URLS,
   INTERVAL_MS = '1200000',        // default 20 րոպե
   PROXY_HOST,
@@ -26,8 +26,17 @@ const {
 
 const urls = JSON.parse(SEARCH_URLS || '[]');
 
-if (!BOT_TOKEN || !CHAT_ID || urls.length === 0) {
-  console.error('❌ Պարտադիր են BOT_TOKEN, CHAT_ID և SEARCH_URLS');
+// CHAT_IDS → զանգված
+let chatIds = [];
+try {
+  chatIds = CHAT_IDS ? JSON.parse(CHAT_IDS) : [];
+} catch (e) {
+  console.error('❌ CHAT_IDS պետք է լինի վավեր JSON, օրինակ՝ [6551638804, 1234567890]');
+  process.exit(1);
+}
+
+if (!BOT_TOKEN || chatIds.length === 0 || urls.length === 0) {
+  console.error('❌ Պարտադիր են BOT_TOKEN, CHAT_IDS և SEARCH_URLS');
   process.exit(1);
 }
 
@@ -279,16 +288,20 @@ async function tick(bot) {
 
       const text = lines.join('\n');
 
-      try {
-        await bot.telegram.sendMessage(CHAT_ID, text);
-        await sleep(1500); // anti-flood
-      } catch (err) {
-        console.error(
-          '❌ Telegram send error:',
-          err.response?.description || err.message,
-          'URL:',
-          item.link,
-        );
+      for (const chatId of chatIds) {
+        try {
+          await bot.telegram.sendMessage(chatId, text);
+          await sleep(1500); // anti-flood
+        } catch (err) {
+          console.error(
+            '❌ Telegram send error:',
+            err.response?.description || err.message,
+            'chatId:',
+            chatId,
+            'URL:',
+            item.link,
+          );
+        }
       }
     }
 
