@@ -1,0 +1,10 @@
+{
+  "enabledFilters": {
+    "sale_apartments": true,
+    "sale_houses": true,
+    "rent_apartments_long": true,
+    "rent_houses_long": true,
+    "sale_commercial": true,
+    "rent_commercial_long": true
+  }
+}
