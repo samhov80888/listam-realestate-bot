@@ -3,3 +3,8 @@ seen-items*.json
 settings*.json
 node_modules
 .DS_Store
+.env
+seen-items*.json
+settings*.json
+node_modules
+.DS_Store
