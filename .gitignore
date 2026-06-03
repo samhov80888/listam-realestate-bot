@@ -1,4 +1,4 @@
-node_modules
 seen-items*.json
+node_modules
 settings*.json
 .DS_Store
