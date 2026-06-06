@@ -563,10 +563,10 @@ function filtersKeyboard() {
     ]);
   }
 
-  rows.push([
-    // Markup.button.callback('🔄 Ստուգել հիմա', 'check_now'),
-    // Markup.button.callback('📊 Կարգավիճակ', 'status'),
-  ]);
+  // rows.push([
+  //   // Markup.button.callback('🔄 Ստուգել հիմա', 'check_now'),
+  //   // Markup.button.callback('📊 Կարգավիճակ', 'status'),
+  // ]);
 
   return Markup.inlineKeyboard(rows);
 }
